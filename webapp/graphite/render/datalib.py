@@ -226,7 +226,7 @@ def fetchData(requestContext, pathExpr):
 
   for dbFile in store.find(pathExpr):
     log.metric_access(dbFile.metric_path)
-    dbResults = dbFile.fetch( timestamp(startTime), timestamp(endTime) )
+    dbResults = dbFile.fetch( timestamp(startTime), timestamp(endTime) , requestContext)
     results = dbResults
 
     if dbFile.isLocal():
