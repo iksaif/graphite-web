@@ -1554,7 +1554,9 @@ def sortByName(requestContext, seriesList):
   Sorts the list of metrics by the metric name.
   """
   def compare(x,y):
-    return cmp(x.name, y.name)
+    convert = lambda text: int(text) if text.isdigit() else text
+    alphanum_key = lambda key: [ convert(c) for c in re.split('([0-9]+)', key) ]
+    return cmp(alphanum_key(x.name), alphanum_key(y.name))
 
   seriesList.sort(compare)
   return seriesList
