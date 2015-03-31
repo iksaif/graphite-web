@@ -169,6 +169,7 @@ class RemoteNode:
     self.real_metric = metric_path
     self.name = metric_path.split('.')[-1]
     self.__isLeaf = isLeaf
+    self.step = 60000
 
   def logcheck(self, start, point, desc=""):
     delta = datetime.now() - start
@@ -180,6 +181,20 @@ class RemoteNode:
 
   time = [0 for i in range(100)]
 
+  def create_body(self, startTime, endTime):
+    body = {'query': {'term': {'parent': int(self.id)}}}
+    aggs = {"by_time": {
+      "histogram": {"field": "ts", "interval": self.step, "min_doc_count": 0, "extended_bounds" : {"min": startTime *1000, "max": endTime * 1000}},
+      "aggs": {"sum": {"sum": {"field": "value"}}}
+    }}
+    aggs = { 'timefilter' : {
+      'filter' : { 'range' : { 'ts' : { 'from' :  startTime *1000, 'to': endTime * 1000 }}},
+      'aggs' : aggs
+    }}
+    body['aggs'] = aggs
+    return body
+
+
   def fetch(self, startTime, endTime, requestContext):
     if not self.__isLeaf:
       return []
@@ -189,19 +204,9 @@ class RemoteNode:
 
     connection = HTTPConnectionWithTimeout(self.store.host, 9200)
     connection.timeout = settings.REMOTE_STORE_FETCH_TIMEOUT
-    step = 60000
     url = 'sagitarius/metric/_search?search_type=count'
-    body = {'query': {'term': {'parent': int(self.id)}}}
-    aggs = {"by_time": {
-      "histogram": {"field": "ts", "interval": step, "min_doc_count": 0, "extended_bounds" : {"min": startTime *1000, "max": endTime * 1000}},
-      "aggs": {"sum": {"sum": {"field": "value"}}}
-    }}
-    aggs = { 'timefilter' : {
-      'filter' : { 'range' : { 'ts' : { 'from' :  startTime *1000, 'to': endTime * 1000 }}},
-      'aggs' : aggs
-    }}
-    body['aggs'] = aggs
     self.logcheck(start, 1, "json creation")
+    body = self.create_body(startTime, endTime)
     post_body = json.dumps(body)
 
     #log.info("curl -XPOST '%s:%d/%s&pretty' -d '%s'" % (self.store.host, 9200, url, post_body))
@@ -219,13 +224,13 @@ class RemoteNode:
     self.logcheck(start, 7, "parse json")
 
     timebuckets = seriesList['aggregations']['timefilter']['by_time']['buckets']
-    expected_points = (int(endTime) - int(startTime)) *1000 / step
+    expected_points = (int(endTime) - int(startTime)) *1000 / self.step
     log.info("took: %d, hits: %d, expected_points: %d, results: %d" % (seriesList['took'], seriesList['hits']['total'], expected_points,len(timebuckets)))
     timestamps = [ d['key'] / 1000 for d in timebuckets ]
     values = dict((d['key'] / 1000, d['sum']['value'] if d['doc_count'] > 0 else None)  for d in timebuckets)
     values = [ d['sum']['value'] if d['doc_count'] > 0 else None  for d in timebuckets]
 
-    timeInfo = (int(startTime), int(endTime), step / 1000)
+    timeInfo = (int(startTime), int(endTime), self.step / 1000)
     self.logcheck(start, 8, "use results")
 
     return (timeInfo, values)
