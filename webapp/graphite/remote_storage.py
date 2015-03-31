@@ -48,6 +48,7 @@ class FindRequest:
     self.cacheKey = compactHash('find:%s:%s' % (self.store.host, query))
     self.cachedResults = None
     self.agglo = re.compile("^criteo.agglo.(.*).all$")
+    self.is_agglo = False
 
   @classmethod
   def glob(fr, idx, val):
@@ -58,18 +59,18 @@ class FindRequest:
 
   @classmethod
   def create_filters(fr, idx, val):
-      queries = []
-      filters = []
-      if ('{' in val and '}' in val):
-        qs = FindRequest.glob(idx, val)
-        return ([qs], [])
-      if '*' == val:
-        return ([], [])
-      if '*' in val:
-        queries.append({'wildcard' : {'field%d' % idx : val }})
-      else:
-        filters.append({'term' : {'field%d' % idx : val }})
-      return (queries, filters)
+    queries = []
+    filters = []
+    if ('{' in val and '}' in val):
+      qs = FindRequest.glob(idx, val)
+      return ([qs], [])
+    if '*' == val:
+      return ([], [])
+    if '*' in val:
+      queries.append({'wildcard' : {'field%d' % idx : val }})
+    else:
+      filters.append({'term' : {'field%d' % idx : val }})
+    return (queries, filters)
 
 
 
@@ -89,7 +90,9 @@ class FindRequest:
 
       queries = []
       filters = []
-      self.query = self.agglo.sub(r'criteo.\1.*', self.query)
+      nw_query = self.agglo.sub(r'criteo.\1.*', self.query)
+      self.is_agglo = nw_query != self.query
+      self.query = nw_query
       subQueries = self.query.split('.')
       token_count = len(subQueries)
       filters.append({'range' : {'token_count' : { 'gte' : token_count } }})
@@ -101,18 +104,18 @@ class FindRequest:
 
       post_body = {}
       if len(filters) > 0:
-	post_body['filter'] = { 'and' : filters }
+        post_body['filter'] = { 'and' : filters }
       if len(queries) > 0:
-	post_body['query'] = { 'bool' : {'must' : queries}}
+        post_body['query'] = { 'bool' : {'must' : queries}}
       post_body['size'] = 100
 
       post_body['sort'] = [ { 'token_count': 'asc' }]
 
       body = json.dumps(post_body)
       headers = {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept' : '*/*'
-      }
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Accept' : '*/*'
+          }
       #self.connection.set_debuglevel(1)
       log.info("curl -XPOST '%s:%d/%s&pretty' -d '%s'" % (self.store.host, 9200, url, body))
       self.connection.request('POST', url, body, headers)
@@ -133,16 +136,28 @@ class FindRequest:
 
     try:
       response = self.connection.getresponse()
-      #log.info("status " + str(response.status))
       assert response.status == 200, "received error response %s - %s" % (response.status, response.reason)
       result_data = json.loads(response.read())
 
-      min_count = 0
       counts = [ r['_source']['token_count'] for r in result_data['hits']['hits'] ]
-      if len(counts) > 0:
-        min_count = min(counts)
+      min_count = min(counts) if len(counts) > 0 else 0
 
-      results = [ {'isLeaf': r['_source']['leaf'], 'metric_path' : r['_source']['path'], '_id': r['_id']} for r in result_data['hits']['hits'] if r['_source']['token_count'] == min_count ]
+      hits = [ r for r in result_data['hits']['hits'] if r['_source']['token_count'] == min_count ]
+
+      if self.is_agglo:
+        log.info("agglo mode")
+        # projection on n-1 hyperplan # dedicace v.jacques
+        to_key = lambda obj: [obj['_source']['field%d' % j] for j in range(min_count-1)]
+
+        results = []
+        for (group, vs) in itertools.groupby(hits, to_key):
+          values = list(vs)
+          path = group
+          path.insert(1, 'agglo')
+          path.append('all')
+          results.append({ 'isLeaf' : values[0]['_source']['leaf'], 'metric_path' : '.'.join(path), '_ids' : [int(r['_id']) for r in values] })
+      else:
+        results = [ {'isLeaf': r['_source']['leaf'], 'metric_path' : r['_source']['path'], '_ids': [int(r['_id'])]} for r in hits ]
 
     except:
       self.store.fail()
@@ -151,7 +166,7 @@ class FindRequest:
       else:
         results = []
 
-    resultNodes = [ RemoteNode(self.store, node['metric_path'], node['isLeaf'], node['_id']) for node in results ]
+    resultNodes = [ RemoteNode(self.store, node['metric_path'], node['isLeaf'], node['_ids']) for node in results ]
     cache.set(self.cacheKey, resultNodes, settings.REMOTE_FIND_CACHE_DURATION)
     self.cachedResults = resultNodes
     return resultNodes
@@ -161,8 +176,8 @@ class FindRequest:
 class RemoteNode:
   context = {}
 
-  def __init__(self, store, metric_path, isLeaf, id):
-    self.id = id
+  def __init__(self, store, metric_path, isLeaf, ids):
+    self.ids = ids
     self.store = store
     self.fs_path = None
     self.metric_path = metric_path
@@ -177,20 +192,28 @@ class RemoteNode:
     RemoteNode.time[point] += duration
     until_now  = RemoteNode.time[point] - RemoteNode.time[point -1 ] if point > 0 else RemoteNode.time[point]
     log.info('%d (%s) took until now : %d micros' % (point, desc, until_now))
-    log.info('parent: %d, time: %f, checkpoint %d' % (int(self.id), duration / 1000, point))
+    if len(self.ids) == 1:
+      id = self.ids[0]
+    else:
+      id = self.metric_path
+    log.info('parent(s): %s, time: %f, checkpoint %d' % (id, duration / 1000, point))
 
   time = [0 for i in range(100)]
 
   def create_body(self, startTime, endTime):
-    body = {'query': {'term': {'parent': int(self.id)}}}
+    if len(self.ids) == 1:
+      body = {'query': {'term': {'parent': self.ids[0]}}}
+    else:
+      body = {'query': {'terms': {'parent': self.ids, 'minimum_should_match': 1}}}
+
     aggs = {"by_time": {
       "histogram": {"field": "ts", "interval": self.step, "min_doc_count": 0, "extended_bounds" : {"min": startTime *1000, "max": endTime * 1000}},
       "aggs": {"sum": {"sum": {"field": "value"}}}
-    }}
+      }}
     aggs = { 'timefilter' : {
       'filter' : { 'range' : { 'ts' : { 'from' :  startTime *1000, 'to': endTime * 1000 }}},
       'aggs' : aggs
-    }}
+      }}
     body['aggs'] = aggs
     return body
 
@@ -209,7 +232,7 @@ class RemoteNode:
     body = self.create_body(startTime, endTime)
     post_body = json.dumps(body)
 
-    #log.info("curl -XPOST '%s:%d/%s&pretty' -d '%s'" % (self.store.host, 9200, url, post_body))
+    log.info("curl -XPOST '%s:%d/%s&pretty' -d '%s'" % (self.store.host, 9200, url, post_body))
 
     self.logcheck(start, 2, "json dump")
     connection.request('POST', url, post_body)
