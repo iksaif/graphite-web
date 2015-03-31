@@ -6,6 +6,15 @@ from django.core.cache import cache
 from django.conf import settings
 from graphite.render.hashing import compactHash
 from graphite.util import unpickle
+from graphite.logger import log
+try:
+  import simplejson as json
+except ImportError:
+  import json
+
+import itertools
+import re
+from datetime import datetime
 
 
 
@@ -38,6 +47,30 @@ class FindRequest:
     self.connection = None
     self.cacheKey = compactHash('find:%s:%s' % (self.store.host, query))
     self.cachedResults = None
+    self.agglo = re.compile("^criteo.agglo.(.*).all$")
+
+  @classmethod
+  def glob(fr, idx, val):
+    parts = [ el.split(',') for el in re.compile('{([^}]+)}').split(val)]
+    globbed =  [''.join(l) for l in itertools.product(*parts)]
+    disj = [{'wildcard' : {'field%d' % idx : el }} for el in globbed]
+    return { "bool" : { "should" : disj } }
+
+  @classmethod
+  def create_filters(fr, idx, val):
+      queries = []
+      filters = []
+      if ('{' in val and '}' in val):
+        qs = FindRequest.glob(idx, val)
+        return ([qs], [])
+      if '*' == val:
+        return ([], [])
+      if '*' in val:
+        queries.append({'wildcard' : {'field%d' % idx : val }})
+      else:
+        filters.append({'term' : {'field%d' % idx : val }})
+      return (queries, filters)
+
 
 
   def send(self):
@@ -46,19 +79,46 @@ class FindRequest:
     if self.cachedResults:
       return
 
-    self.connection = HTTPConnectionWithTimeout(self.store.host)
+    self.connection = HTTPConnectionWithTimeout(self.store.host, 9200)
     self.connection.timeout = settings.REMOTE_STORE_FIND_TIMEOUT
 
-    query_params = [
-      ('local', '1'),
-      ('format', 'pickle'),
-      ('query', self.query),
-    ]
-    query_string = urlencode(query_params)
+    self.query.count('.')
 
     try:
-      self.connection.request('GET', '/metrics/find/?' + query_string)
-    except:
+      url =  'sagitarius-metrics/metadata/_search?'
+
+      queries = []
+      filters = []
+      self.query = self.agglo.sub(r'criteo.\1.*', self.query)
+      subQueries = self.query.split('.')
+      token_count = len(subQueries)
+      filters.append({'range' : {'token_count' : { 'gte' : token_count } }})
+      for idx, val in enumerate(subQueries):
+        qs, fs = FindRequest.create_filters(idx, val)
+        log.info(qs)
+        queries.extend(qs)
+        filters.extend(fs)
+
+      post_body = {}
+      if len(filters) > 0:
+	post_body['filter'] = { 'and' : filters }
+      if len(queries) > 0:
+	post_body['query'] = { 'bool' : {'must' : queries}}
+      post_body['size'] = 100
+
+      post_body['sort'] = [ { 'token_count': 'asc' }]
+
+      body = json.dumps(post_body)
+      headers = {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept' : '*/*'
+      }
+      #self.connection.set_debuglevel(1)
+      log.info("curl -XPOST '%s:%d/%s&pretty' -d '%s'" % (self.store.host, 9200, url, body))
+      self.connection.request('POST', url, body, headers)
+    except Exception as e :
+      log.info("failed")
+      log.info(str(e))
       self.store.fail()
       if not self.suppressErrors:
         raise
@@ -73,9 +133,16 @@ class FindRequest:
 
     try:
       response = self.connection.getresponse()
+      #log.info("status " + str(response.status))
       assert response.status == 200, "received error response %s - %s" % (response.status, response.reason)
-      result_data = response.read()
-      results = unpickle.loads(result_data)
+      result_data = json.loads(response.read())
+
+      min_count = 0
+      counts = [ r['_source']['token_count'] for r in result_data['hits']['hits'] ]
+      if len(counts) > 0:
+        min_count = min(counts)
+
+      results = [ {'isLeaf': r['_source']['leaf'], 'metric_path' : r['_source']['path'], '_id': r['_id']} for r in result_data['hits']['hits'] if r['_source']['token_count'] == min_count ]
 
     except:
       self.store.fail()
@@ -84,7 +151,7 @@ class FindRequest:
       else:
         results = []
 
-    resultNodes = [ RemoteNode(self.store, node['metric_path'], node['isLeaf']) for node in results ]
+    resultNodes = [ RemoteNode(self.store, node['metric_path'], node['isLeaf'], node['_id']) for node in results ]
     cache.set(self.cacheKey, resultNodes, settings.REMOTE_FIND_CACHE_DURATION)
     self.cachedResults = resultNodes
     return resultNodes
@@ -94,7 +161,8 @@ class FindRequest:
 class RemoteNode:
   context = {}
 
-  def __init__(self, store, metric_path, isLeaf):
+  def __init__(self, store, metric_path, isLeaf, id):
+    self.id = id
     self.store = store
     self.fs_path = None
     self.metric_path = metric_path
@@ -102,35 +170,65 @@ class RemoteNode:
     self.name = metric_path.split('.')[-1]
     self.__isLeaf = isLeaf
 
+  def logcheck(self, start, point, desc=""):
+    delta = datetime.now() - start
+    duration = delta.microseconds + delta.seconds * 1000000 # ignoring delta.days
+    RemoteNode.time[point] += duration
+    until_now  = RemoteNode.time[point] - RemoteNode.time[point -1 ] if point > 0 else RemoteNode.time[point]
+    log.info('%d (%s) took until now : %d micros' % (point, desc, until_now))
+    log.info('parent: %d, time: %f, checkpoint %d' % (int(self.id), duration / 1000, point))
+
+  time = [0 for i in range(100)]
 
   def fetch(self, startTime, endTime, requestContext):
     if not self.__isLeaf:
       return []
+    start = datetime.now()
 
-    query_params = [
-      ('target', self.metric_path),
-      ('format', 'pickle'),
-      ('from', str( int(startTime) )),
-      ('until', str( int(endTime) ))
-    ]
-    if 'cacheTimeout' in requestContext:
-      query_params.append(('cacheTimeout', str(requestContext['cacheTimeout'])))
+    self.logcheck(start, 0)
 
-    query_string = urlencode(query_params)
-
-    connection = HTTPConnectionWithTimeout(self.store.host)
+    connection = HTTPConnectionWithTimeout(self.store.host, 9200)
     connection.timeout = settings.REMOTE_STORE_FETCH_TIMEOUT
-    connection.request('GET', '/render/?' + query_string)
+    step = 60000
+    url = 'sagitarius/metric/_search?search_type=count'
+    body = {'query': {'term': {'parent': int(self.id)}}}
+    aggs = {"by_time": {
+      "histogram": {"field": "ts", "interval": step, "min_doc_count": 0, "extended_bounds" : {"min": startTime *1000, "max": endTime * 1000}},
+      "aggs": {"sum": {"sum": {"field": "value"}}}
+    }}
+    aggs = { 'timefilter' : {
+      'filter' : { 'range' : { 'ts' : { 'from' :  startTime *1000, 'to': endTime * 1000 }}},
+      'aggs' : aggs
+    }}
+    body['aggs'] = aggs
+    self.logcheck(start, 1, "json creation")
+    post_body = json.dumps(body)
+
+    #log.info("curl -XPOST '%s:%d/%s&pretty' -d '%s'" % (self.store.host, 9200, url, post_body))
+
+    self.logcheck(start, 2, "json dump")
+    connection.request('POST', url, post_body)
+    self.logcheck(start, 3, "post request")
     response = connection.getresponse()
+    self.logcheck(start, 4, "get response")
     assert response.status == 200, "Failed to retrieve remote data: %d %s" % (response.status, response.reason)
+    self.logcheck(start, 5, "check status")
     rawData = response.read()
+    self.logcheck(start, 6, "read response")
+    seriesList = json.loads(rawData)
+    self.logcheck(start, 7, "parse json")
 
-    seriesList = unpickle.loads(rawData)
-    assert len(seriesList) == 1, "Invalid result: seriesList=%s" % str(seriesList)
-    series = seriesList[0]
+    timebuckets = seriesList['aggregations']['timefilter']['by_time']['buckets']
+    expected_points = (int(endTime) - int(startTime)) *1000 / step
+    log.info("took: %d, hits: %d, expected_points: %d, results: %d" % (seriesList['took'], seriesList['hits']['total'], expected_points,len(timebuckets)))
+    timestamps = [ d['key'] / 1000 for d in timebuckets ]
+    values = dict((d['key'] / 1000, d['sum']['value'] if d['doc_count'] > 0 else None)  for d in timebuckets)
+    values = [ d['sum']['value'] if d['doc_count'] > 0 else None  for d in timebuckets]
 
-    timeInfo = (series['start'], series['end'], series['step'])
-    return (timeInfo, series['values'])
+    timeInfo = (int(startTime), int(endTime), step / 1000)
+    self.logcheck(start, 8, "use results")
+
+    return (timeInfo, values)
 
   def isLeaf(self):
     return self.__isLeaf
