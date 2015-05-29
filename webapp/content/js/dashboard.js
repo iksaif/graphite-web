@@ -1045,6 +1045,12 @@ function updateAutoRefresh (newValue) {
     return;
   }
 
+  // Minimum 5min interval for auto-refresh
+  if (value < 300) {
+    value = 300;
+    Ext.getCmp('auto-refresh-field').setValue('' + value);
+  }
+
   if (Ext.getCmp('auto-refresh-button').pressed) {
     stopTask(refreshTask);
     refreshTask.interval = value * 1000;
