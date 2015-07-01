@@ -796,7 +796,6 @@ def movingAverage(requestContext, seriesList, windowSize):
 
   return result
 
-def cumulative(requestContext, seriesList):
 def cumulative(requestContext, seriesList, consolidationFunc='sum'):
   """
   Takes one metric or a wildcard seriesList.
