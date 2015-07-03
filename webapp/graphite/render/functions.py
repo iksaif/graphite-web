@@ -2339,6 +2339,8 @@ def reduceSeries(requestContext, seriesLists, reduceFunction, reduceNode, *reduc
       nodes = series.name.split('.')
       node = nodes[reduceNode]
       reduceSeriesName = '.'.join(nodes[0:reduceNode]) + '.reduce.' + reduceFunction
+      if len(nodes) > reduceNode + 2:
+        reduceSeriesName = reduceSeriesName + '.' + '.'.join(nodes[reduceNode+2:])
       if node in reduceMatchers:
         if reduceSeriesName not in metaSeries:
           metaSeries[reduceSeriesName] = [None] * len(reduceMatchers)
